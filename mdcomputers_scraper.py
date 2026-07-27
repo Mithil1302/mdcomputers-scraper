@@ -23,17 +23,72 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from curl_cffi import requests as curl_requests  # modern TLS fingerprint impersonation for Cloudflare
+    _HAS_CURL_CFFI = True
+except ImportError:
+    _HAS_CURL_CFFI = False
+
+try:
+    import cloudscraper  # optional fallback for basic anti-bot/Cloudflare-style checks
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+
 BASE_URL = "https://mdcomputers.in/"
 SEARCH_ROUTE = "index.php?route=product/search"
 
+# A 403 from a storefront almost always means the server is fingerprinting the
+# request as "not a real browser" rather than blocking the IP outright. A bare
+# User-Agent is usually not enough - real browsers send a full header set
+# (Accept, Accept-Encoding, sec-ch-ua, etc.) in a specific order, and some
+# sites also require an initial cookie-setting request before they'll serve
+# the actual page. The headers below and the session warm-up in
+# `make_session()` mimic that more closely.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Referer": "https://mdcomputers.in/",
 }
+
+
+def make_session():
+    """
+    Build a session and prefer `curl_cffi` (mimics browser TLS/HTTP2 fingerprints
+    to bypass Cloudflare), falling back to `cloudscraper` or a plain requests.Session.
+    """
+    if _HAS_CURL_CFFI:
+        return curl_requests.Session(impersonate="chrome")
+    elif _HAS_CLOUDSCRAPER:
+        session = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+    else:
+        session = requests.Session()
+
+    session.headers.update(HEADERS)
+
+    try:
+        session.get(BASE_URL, timeout=15)
+    except requests.RequestException:
+        pass  # warm-up is best-effort; the real request will surface any real error
+
+    return session
 
 
 def build_search_url(search_term: str, page: int = 1) -> str:
@@ -45,14 +100,17 @@ def build_search_url(search_term: str, page: int = 1) -> str:
     return url
 
 
-def fetch_page(url: str, session: requests.Session, retries: int = 3, timeout: int = 15):
+def fetch_page(url: str, session, retries: int = 3, timeout: int = 15):
     """Fetch a URL with basic retry logic. Returns the response text or None."""
     for attempt in range(1, retries + 1):
         try:
-            response = session.get(url, headers=HEADERS, timeout=timeout)
+            if _HAS_CURL_CFFI and isinstance(session, curl_requests.Session):
+                response = session.get(url, timeout=timeout)
+            else:
+                response = session.get(url, headers=HEADERS, timeout=timeout)
             response.raise_for_status()
             return response.text
-        except requests.RequestException as exc:
+        except Exception as exc:
             print(f"[warn] attempt {attempt}/{retries} failed for {url}: {exc}", file=sys.stderr)
             time.sleep(1.5 * attempt)
     return None
@@ -80,14 +138,24 @@ def parse_products(html: str):
     # and its nested card (.product-thumb) as two separate "products".
     cards = soup.select(".product-thumb")
     if not cards:
+        cards = soup.select(".product-grid-item")
+    if not cards:
         cards = soup.select(".product-layout")
+    if not cards:
+        cards = soup.select(".product-wrapper")
     if not cards:
         # Fallback: some theme variants wrap cards in <div class="product-item">
         cards = soup.select("[class*='product-item']")
 
     for card in cards:
         # --- Name & product URL ---
-        name_tag = card.select_one(".caption h4 a") or card.select_one("h4 a") or card.select_one(".name a")
+        name_tag = (
+            card.select_one(".product-entities-title a")
+            or card.select_one(".caption h4 a")
+            or card.select_one("h4 a")
+            or card.select_one("h3 a")
+            or card.select_one(".name a")
+        )
         name = _clean_text(name_tag)
         product_url = name_tag.get("href", "").strip() if name_tag else ""
 
@@ -96,14 +164,27 @@ def parse_products(html: str):
             continue
 
         # --- Image ---
-        img_tag = card.select_one(".image img") or card.select_one("img")
+        img_tag = (
+            card.select_one(".product-image-link img")
+            or card.select_one(".image img")
+            or card.select_one("img")
+        )
         image_url = ""
         if img_tag:
             image_url = img_tag.get("data-src") or img_tag.get("src") or ""
 
         # --- Prices (current / discounted, and original if on sale) ---
-        price_new_tag = card.select_one(".price-new") or card.select_one(".price")
-        price_old_tag = card.select_one(".price-old")
+        price_new_tag = (
+            card.select_one(".ins .amount")
+            or card.select_one(".ins")
+            or card.select_one(".price-new")
+            or card.select_one(".price")
+        )
+        price_old_tag = (
+            card.select_one(".del .amount")
+            or card.select_one(".del")
+            or card.select_one(".price-old")
+        )
 
         price_new = _clean_text(price_new_tag)
         price_old = _clean_text(price_old_tag)
@@ -119,7 +200,7 @@ def parse_products(html: str):
                 price_new = raw_price_text
 
         # --- Discount badge, e.g. "-23%" ---
-        discount_tag = card.select_one(".ex-tax, .special-tag, .product-badge, .label-danger")
+        discount_tag = card.select_one(".onsale, .product-label, .ex-tax, .special-tag, .product-badge, .label-danger")
         discount = _clean_text(discount_tag)
 
         # --- Stock status (not always present on the listing page) ---
@@ -158,7 +239,7 @@ def scrape(search_term: str, max_pages: int = 1, delay: float = 1.0):
     Scrape MDComputers for `search_term` across up to `max_pages` pages.
     Returns a list of product dicts. Stops early if a page returns no products.
     """
-    session = requests.Session()
+    session = make_session()
     all_products = []
 
     first_url = build_search_url(search_term, page=1)
@@ -199,6 +280,11 @@ def save_to_csv(products, filepath: str):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Scrape product details from MDComputers.in for a given search term."
     )
