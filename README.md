@@ -20,7 +20,7 @@ For each matching product it extracts:
 ## Setup
 
 ```bash
-git clone https://github.com/<your-username>/mdcomputers-scraper.git
+git clone https://github.com/Mithil1302/mdcomputers-scraper.git
 cd mdcomputers-scraper
 pip install -r requirements.txt
 ```
